@@ -1,0 +1,1408 @@
+import logging
+from abc import ABC
+from collections import defaultdict
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
+from functools import wraps
+from typing import TYPE_CHECKING, Any, Literal, Optional, TypeVar, cast, overload
+
+from gevent.lock import Semaphore
+
+from rotkehlchen.api.websockets.typedefs import (
+    TransactionStatusStep,
+    TransactionStatusSubType,
+    WSMessageType,
+)
+from rotkehlchen.assets.asset import EvmToken
+from rotkehlchen.chain.evm.constants import GENESIS_HASH, LAST_SPAM_TXS_CACHE
+from rotkehlchen.chain.evm.decoding.constants import ERC20_OR_ERC721_TRANSFER
+from rotkehlchen.chain.evm.types import EvmAccount
+from rotkehlchen.chain.structures import TimestampOrBlockRange
+from rotkehlchen.constants.resolver import evm_address_to_identifier
+from rotkehlchen.db.cache import DBCacheDynamic
+from rotkehlchen.db.constants import TX_INTERNALS_QUERIED
+from rotkehlchen.db.evmtx import DBEvmTx
+from rotkehlchen.db.filtering import EvmTransactionsFilterQuery
+from rotkehlchen.db.ranges import DBQueryRanges
+from rotkehlchen.db.utils import get_query_chunks
+from rotkehlchen.errors.asset import UnknownAsset
+from rotkehlchen.errors.misc import AlreadyExists, InputError, NoAvailableIndexers, RemoteError
+from rotkehlchen.errors.serialization import DeserializationError
+from rotkehlchen.logging import RotkehlchenLogsAdapter
+from rotkehlchen.serialization.deserialize import deserialize_evm_address
+from rotkehlchen.tasks.assets import MULTISEND_SPAM_THRESHOLD
+from rotkehlchen.types import (
+    CHAINID_TO_SUPPORTED_BLOCKCHAIN,
+    SPAM_PROTOCOL,
+    ChainID,
+    ChecksumEvmAddress,
+    EvmInternalTransaction,
+    EvmTransaction,
+    EVMTxHash,
+    Timestamp,
+    TokenKind,
+    deserialize_evm_tx_hash,
+)
+from rotkehlchen.utils.hexbytes import hexstring_to_bytes
+from rotkehlchen.utils.misc import ts_now
+
+if TYPE_CHECKING:
+    from rotkehlchen.chain.evm.node_inquirer import EvmNodeInquirer
+    from rotkehlchen.chain.evm.structures import EvmTxReceipt
+    from rotkehlchen.db.dbhandler import DBHandler
+    from rotkehlchen.db.drivers.gevent import DBCursor
+
+
+logger = logging.getLogger(__name__)
+log = RotkehlchenLogsAdapter(logger)
+
+T = TypeVar('T', bound=Callable[..., Any])
+
+
+def with_tx_status_messaging(func: T) -> T:
+    """Decorator to handle transaction query locking and status messaging."""
+
+    @wraps(func)
+    def wrapper(
+            self: 'EvmTransactions',
+            address: ChecksumEvmAddress,
+            start_ts: Timestamp,
+            end_ts: Timestamp,
+            *args: Any,
+            **kwargs: Any,
+    ) -> Any:
+        with self.address_tx_locks[address]:
+            self.msg_aggregator.add_message(
+                message_type=WSMessageType.TRANSACTION_STATUS,
+                data={
+                    'address': address,
+                    'chain': self.evm_inquirer.blockchain.value,
+                    'subtype': str(TransactionStatusSubType.EVM),
+                    'period': [start_ts, end_ts],
+                    'status': str(TransactionStatusStep.QUERYING_TRANSACTIONS_STARTED),
+                },
+            )
+            try:
+                result = func(self, address, start_ts, end_ts, *args, **kwargs)
+            finally:  # always send completion status to prevent inconclusive frontend state
+                self.msg_aggregator.add_message(
+                    message_type=WSMessageType.TRANSACTION_STATUS,
+                    data={
+                        'address': address,
+                        'chain': self.evm_inquirer.blockchain.value,
+                        'subtype': str(TransactionStatusSubType.EVM),
+                        'period': [start_ts, end_ts],
+                        'status': str(TransactionStatusStep.QUERYING_TRANSACTIONS_FINISHED),
+                    },
+                )
+
+            return result
+
+    return cast('T', wrapper)  # Cast to preserve the original type signature
+
+
+class EvmTransactions(ABC):  # noqa: B024
+
+    def __init__(
+            self,
+            evm_inquirer: 'EvmNodeInquirer',
+            database: 'DBHandler',
+    ) -> None:
+        super().__init__()
+        self.evm_inquirer = evm_inquirer
+        self.database = database
+        self.dbranges = DBQueryRanges(self.database)
+        self.address_tx_locks: dict[ChecksumEvmAddress, Semaphore] = defaultdict(Semaphore)
+        self.missing_receipts_lock = Semaphore()
+        self.msg_aggregator = database.msg_aggregator
+        self.dbevmtx = DBEvmTx(database)
+
+    def _get_existing_evm_tx_hashes(
+            self,
+            cursor: 'DBCursor',
+            tx_hashes: Sequence[EVMTxHash],
+    ) -> set[EVMTxHash]:
+        """Return tx hashes already stored for this chain to filter return_queried_hashes.
+
+        We need this because add_transactions uses INSERT OR IGNORE, so we must pre-check
+        to avoid reporting hashes that were not newly saved.
+        """
+        existing_hashes: set[EVMTxHash] = set()
+        if len(tx_hashes) == 0:
+            return existing_hashes
+
+        serialized_chain_id = self.evm_inquirer.chain_id.serialize_for_db()
+        for tx_hash_chunk, placeholders in get_query_chunks(tx_hashes):
+            cursor.execute(
+                f'SELECT tx_hash FROM evm_transactions '
+                f'WHERE chain_id=? AND tx_hash IN ({placeholders})',
+                (serialized_chain_id, *tx_hash_chunk),
+            )
+            existing_hashes.update(
+                deserialize_evm_tx_hash(entry[0]) for entry in cursor
+            )
+
+        return existing_hashes
+
+    @contextmanager
+    def wait_until_no_query_for(self, addresses: list[ChecksumEvmAddress]) -> Iterator[None]:
+        """Will acquire all locks relevant to an address and yield to the caller"""
+        locks = []
+        for address in addresses:
+            lock = self.address_tx_locks[address]
+            lock.acquire()
+            locks.append(lock)
+
+        yield  # yield to caller since all locks are now acquired
+
+        for lock in locks:  # clean up
+            lock.release()
+
+    @with_tx_status_messaging
+    def single_address_query_transactions(
+            self,
+            address: ChecksumEvmAddress,
+            start_ts: Timestamp,
+            end_ts: Timestamp,
+    ) -> None:
+        """Only queries new transactions and adds them to the DB
+
+        This is our attempt to identify as many transactions related to the address
+        as possible. This unfortunately at the moment depends on etherscan as it's
+        the only open indexing service for "appearances" of an address.
+
+        Trueblocks ... we need you.
+        """
+        self._get_transactions_for_range(address=address, start_ts=start_ts, end_ts=end_ts)
+        self._get_internal_transactions_for_ranges(
+            address=address,
+            start_ts=start_ts,
+            end_ts=end_ts,
+        )
+        self._get_erc20_transfers_for_ranges(
+            address=address,
+            start_ts=start_ts,
+            end_ts=end_ts,
+        )
+
+    def query_chain(
+            self,
+            from_timestamp: Timestamp,
+            to_timestamp: Timestamp,
+            addresses: list[ChecksumEvmAddress],
+    ) -> None:
+        """Queries the chain (or a remote such as etherscan) for all transactions of the specified
+        evm addresses. It is the responsibility of the caller to only specify addresses for the
+        correct chain. Will query only the part of the time range that has not yet been queried.
+
+        Saves the results in the database.
+
+        May raise:
+        - RemoteError if etherscan is used and there is a problem with reaching it or
+        with parsing the response.
+        - sqlcipher3.dbapi2.OperationalError if the SQL query fails due to
+        invalid filtering arguments.
+        """
+        for address in addresses:
+            self.single_address_query_transactions(
+                address=address,
+                start_ts=from_timestamp,
+                end_ts=to_timestamp,
+            )
+        self.get_chain_specific_multiaddress_data(addresses)
+
+    @overload
+    def _query_and_save_transactions_for_range(
+            self,
+            address: ChecksumEvmAddress,
+            period: TimestampOrBlockRange,
+            location_string: str | None = None,
+            update_ranges: bool = True,
+            return_queried_hashes: Literal[True] = True,
+    ) -> list[EVMTxHash]:
+        ...
+
+    @overload
+    def _query_and_save_transactions_for_range(
+            self,
+            address: ChecksumEvmAddress,
+            period: TimestampOrBlockRange,
+            location_string: str | None = None,
+            update_ranges: bool = True,
+            return_queried_hashes: Literal[False] = False,
+    ) -> None:
+        ...
+
+    @overload
+    def _query_and_save_transactions_for_range(
+            self,
+            address: ChecksumEvmAddress,
+            period: TimestampOrBlockRange,
+            location_string: str | None = None,
+            update_ranges: bool = True,
+            return_queried_hashes: bool = False,
+    ) -> list[EVMTxHash] | None:
+        ...
+
+    def _query_and_save_transactions_for_range(
+            self,
+            address: ChecksumEvmAddress,
+            period: TimestampOrBlockRange,
+            location_string: str | None = None,
+            update_ranges: bool = True,
+            return_queried_hashes: bool = False,
+    ) -> list[EVMTxHash] | None:
+        """Helper function to abstract tx querying functionality for different range types
+
+        If update_ranges is True, updates the database tracking for this query range.
+        Otherwise, data is fetched without updating the query range.
+        If return_queried_hashes is True, returns only the transaction hashes that were saved.
+        """
+        period_as_blocks = self.evm_inquirer.maybe_timestamp_to_block_range(period)
+        queried_hashes: list[EVMTxHash] | None = [] if return_queried_hashes else None
+        queried_from_ts = Timestamp(period.from_value)
+        for new_transactions in self.evm_inquirer.get_transactions(
+                account=address,
+                action='txlist',
+                period_or_hash=period_as_blocks,
+        ):
+            # add new transactions to the DB
+            if len(new_transactions) == 0:
+                continue
+
+            if queried_hashes is not None:
+                with self.database.conn.read_ctx() as cursor:
+                    existing_hashes = self._get_existing_evm_tx_hashes(
+                        cursor=cursor,
+                        tx_hashes=[tx.tx_hash for tx in new_transactions],
+                    )
+
+                for tx in new_transactions:
+                    if tx.tx_hash not in existing_hashes:
+                        queried_hashes.append(tx.tx_hash)
+                        existing_hashes.add(tx.tx_hash)
+
+            with self.database.user_write() as write_cursor:
+                self.dbevmtx.add_transactions(
+                    write_cursor=write_cursor,
+                    evm_transactions=new_transactions,
+                    relevant_address=address,
+                )
+
+                if period.range_type == 'timestamps':
+                    assert location_string, 'should always be given for timestamps'
+                    queried_to_ts = Timestamp(max(queried_from_ts, new_transactions[-1].timestamp))
+                    log.debug(f'{self.evm_inquirer.chain_name} transactions for {address} -> update range {queried_from_ts} - {queried_to_ts}')  # noqa: E501
+                    if update_ranges:  # update last queried time for the address
+                        self.dbranges.update_used_query_range(
+                            write_cursor=write_cursor,
+                            location_string=location_string,
+                            queried_ranges=[(queried_from_ts, queried_to_ts)],
+                        )
+                    queried_from_ts = queried_to_ts
+
+            self.msg_aggregator.add_message(
+                message_type=WSMessageType.TRANSACTION_STATUS,
+                data={
+                    'address': address,
+                    'chain': self.evm_inquirer.blockchain.value,
+                    'subtype': str(TransactionStatusSubType.EVM),
+                    'period': [period.from_value, new_transactions[-1].timestamp],
+                    'status': str(TransactionStatusStep.QUERYING_TRANSACTIONS),
+                },
+            )
+        return queried_hashes
+
+    def _get_transactions_for_range(
+            self,
+            address: ChecksumEvmAddress,
+            start_ts: Timestamp,
+            end_ts: Timestamp,
+    ) -> None:
+        """Queries etherscan for all evm transactions of address in the given ranges.
+
+        If any transactions are found, they are added in the DB
+        """
+        location_string = f'{self.evm_inquirer.blockchain.to_range_prefix("txs")}_{address}'
+        with self.database.conn.read_ctx() as cursor:
+            ranges_to_query = self.dbranges.get_location_query_ranges(
+                cursor=cursor,
+                location_string=location_string,
+                start_ts=start_ts,
+                end_ts=end_ts,
+            )
+        for query_start_ts, query_end_ts in ranges_to_query:
+            log.debug(f'Querying {self.evm_inquirer.chain_name} transactions for {address} -> {query_start_ts} - {query_end_ts}')  # noqa: E501
+            try:
+                self._query_and_save_transactions_for_range(
+                    address=address,
+                    period=TimestampOrBlockRange(
+                        range_type='timestamps',
+                        from_value=query_start_ts,
+                        to_value=query_end_ts,
+                    ),
+                    location_string=location_string,
+                )
+            except NoAvailableIndexers as e:
+                log.warning(
+                    f'Skipping {self.evm_inquirer.chain_name} transactions query '
+                    f'for {address} due to {e!s}.',
+                )
+                return
+            except RemoteError as e:
+                log.error(
+                    f'Got error "{e!s}" while querying {self.evm_inquirer.chain_name} '
+                    f'transactions from indexers. Some transactions not added to the DB '
+                    f'address: {address} '
+                    f'from_ts: {query_start_ts} '
+                    f'to_ts: {query_end_ts} ',
+                )
+                return
+
+        log.debug(f'{self.evm_inquirer.chain_name} transactions done for {address}. Update range {start_ts} - {end_ts}')  # noqa: E501
+        with self.database.user_write() as write_cursor:
+            self.dbranges.update_used_query_range(  # entire range is now considered queried
+                write_cursor=write_cursor,
+                location_string=location_string,
+                queried_ranges=[(start_ts, end_ts)],
+            )
+
+    @overload
+    def _query_and_save_internal_transactions_for_range(
+            self,
+            period: TimestampOrBlockRange,
+            address: ChecksumEvmAddress | None = None,
+            location_string: str | None = None,
+            update_ranges: bool = True,
+            return_queried_hashes: Literal[True] = True,
+    ) -> list[EVMTxHash]:
+        ...
+
+    @overload
+    def _query_and_save_internal_transactions_for_range(
+            self,
+            period: TimestampOrBlockRange,
+            address: ChecksumEvmAddress | None = None,
+            location_string: str | None = None,
+            update_ranges: bool = True,
+            return_queried_hashes: Literal[False] = False,
+    ) -> None:
+        ...
+
+    @overload
+    def _query_and_save_internal_transactions_for_range(
+            self,
+            period: TimestampOrBlockRange,
+            address: ChecksumEvmAddress | None = None,
+            location_string: str | None = None,
+            update_ranges: bool = True,
+            return_queried_hashes: bool = False,
+    ) -> list[EVMTxHash] | None:
+        ...
+
+    def _query_and_save_internal_transactions_for_range(
+            self,
+            period: TimestampOrBlockRange,
+            address: ChecksumEvmAddress | None = None,
+            location_string: str | None = None,
+            update_ranges: bool = True,
+            return_queried_hashes: bool = False,
+    ) -> list[EVMTxHash] | None:
+        """Query internal txs for a time/block range and persist them incrementally."""
+        queried_hashes: list[EVMTxHash] | None = [] if return_queried_hashes else None
+        parent_tx_timestamps: dict[EVMTxHash, Timestamp] = {}
+        replaced_parent_hashes: set[EVMTxHash] = set()
+        if period.range_type == 'timestamps':
+            assert location_string, 'should always be given for timestamps'
+            queried_from_ts = Timestamp(period.from_value)
+        else:
+            queried_from_ts = None
+
+        for new_internal_txs in self.evm_inquirer.get_transactions(
+                account=address,
+                period_or_hash=self.evm_inquirer.maybe_timestamp_to_block_range(period=period),
+                action='txlistinternal',
+        ):
+            if len(internal_txs_with_timestamps := self._process_internal_transactions_batch(
+                new_internal_txs=new_internal_txs,
+                address=address,
+                parent_tx_timestamps=parent_tx_timestamps,
+                queried_hashes=queried_hashes,
+            )) == 0:
+                continue
+
+            batch_transactions: list[EvmInternalTransaction] = []
+            parent_tx_hashes: set[EVMTxHash] = set()
+            for internal_tx, _ in internal_txs_with_timestamps:
+                batch_transactions.append(internal_tx)
+                parent_tx_hashes.add(internal_tx.parent_tx_hash)
+
+            # deletes internal tx before readding them and after repulling them
+            with self.database.conn.write_ctx() as write_cursor:
+                for parent_tx_hash in parent_tx_hashes:
+                    if parent_tx_hash in replaced_parent_hashes:
+                        continue
+
+                    if address is None:
+                        self.dbevmtx.delete_evm_internal_transactions_by_parent_tx_hash(
+                            write_cursor=write_cursor,
+                            parent_tx_hash=parent_tx_hash,
+                            chain_id=self.evm_inquirer.chain_id,
+                        )
+                    else:
+                        self.dbevmtx.delete_evm_internal_transactions_by_parent_tx_hash_and_address(
+                            write_cursor=write_cursor,
+                            parent_tx_hash=parent_tx_hash,
+                            chain_id=self.evm_inquirer.chain_id,
+                            address=address,
+                        )
+                    replaced_parent_hashes.add(parent_tx_hash)
+
+                self.dbevmtx.add_evm_internal_transactions(
+                    write_cursor=write_cursor,
+                    transactions=batch_transactions,
+                    relevant_address=None,
+                )
+
+            if queried_from_ts is None:
+                continue
+
+            for _, timestamp in internal_txs_with_timestamps:
+                queried_to_ts = Timestamp(max(queried_from_ts, timestamp))
+                log.debug(f'Internal {self.evm_inquirer.chain_name} transactions for {address} -> update range {queried_from_ts} - {queried_to_ts}')  # noqa: E501
+                if update_ranges:  # update last queried time for address
+                    assert location_string is not None, 'should always be given for timestamps'
+                    with self.database.conn.write_ctx() as write_cursor:
+                        self.dbranges.update_used_query_range(
+                            write_cursor=write_cursor,
+                            location_string=location_string,
+                            queried_ranges=[(queried_from_ts, queried_to_ts)],
+                        )
+
+                self.msg_aggregator.add_message(
+                    message_type=WSMessageType.TRANSACTION_STATUS,
+                    data={
+                        'address': address,
+                        'chain': self.evm_inquirer.blockchain.value,
+                        'subtype': str(TransactionStatusSubType.EVM),
+                        'period': [period.from_value, timestamp],
+                        'status': str(TransactionStatusStep.QUERYING_INTERNAL_TRANSACTIONS),
+                    },
+                )
+                queried_from_ts = queried_to_ts
+
+        return queried_hashes
+
+    @overload
+    def _query_and_save_internal_transactions_for_parent_hash(
+            self,
+            parent_tx_hash: EVMTxHash,
+            address: ChecksumEvmAddress | None = None,
+            return_queried_hashes: Literal[True] = True,
+    ) -> list[EVMTxHash]:
+        ...
+
+    @overload
+    def _query_and_save_internal_transactions_for_parent_hash(
+            self,
+            parent_tx_hash: EVMTxHash,
+            address: ChecksumEvmAddress | None = None,
+            return_queried_hashes: Literal[False] = False,
+    ) -> None:
+        ...
+
+    @overload
+    def _query_and_save_internal_transactions_for_parent_hash(
+            self,
+            parent_tx_hash: EVMTxHash,
+            address: ChecksumEvmAddress | None = None,
+            return_queried_hashes: bool = False,
+    ) -> list[EVMTxHash] | None:
+        ...
+
+    def _query_and_save_internal_transactions_for_parent_hash(
+            self,
+            parent_tx_hash: EVMTxHash,
+            address: ChecksumEvmAddress | None = None,
+            return_queried_hashes: bool = False,
+    ) -> list[EVMTxHash] | None:
+        """Query internal txs for a parent hash and atomically replace DB internals."""
+        parent_hash_internal_txs, queried_hashes = (
+            self._query_internal_transactions_for_parent_hash(
+                parent_tx_hash=parent_tx_hash,
+                address=address,
+                return_queried_hashes=return_queried_hashes,
+            )
+        )
+        with self.database.user_write() as write_cursor:
+            self._replace_internal_transactions_for_parent_hash(
+                write_cursor=write_cursor,
+                parent_tx_hash=parent_tx_hash,
+                transactions=parent_hash_internal_txs,
+            )
+        return queried_hashes
+
+    def _query_internal_transactions(
+            self,
+            query_period_or_hash: TimestampOrBlockRange | EVMTxHash,
+            address: ChecksumEvmAddress | None,
+            return_queried_hashes: bool,
+            known_parent_timestamps: dict[EVMTxHash, Timestamp] | None = None,
+    ) -> tuple[list[tuple[EvmInternalTransaction, Timestamp]], list[EVMTxHash] | None]:
+        """Query internal transactions and normalize parent-transaction state.
+
+        This helper is shared by both range and parent-hash flows and has no
+        side effects on internal-transactions persistence.
+        For each non-zero-value internal transaction it ensures the parent
+        transaction exists in the DB via `get_or_create_transaction`.
+        """
+        internal_txs_with_timestamps: list[tuple[EvmInternalTransaction, Timestamp]] = []
+        parent_tx_timestamps: dict[EVMTxHash, Timestamp] = (
+            known_parent_timestamps.copy() if known_parent_timestamps is not None else {}
+        )
+        queried_hashes: list[EVMTxHash] | None = [] if return_queried_hashes else None
+        for new_internal_txs in self.evm_inquirer.get_transactions(
+                account=address,
+                period_or_hash=query_period_or_hash,
+                action='txlistinternal',
+        ):
+            internal_txs_with_timestamps.extend(self._process_internal_transactions_batch(
+                new_internal_txs=new_internal_txs,
+                address=address,
+                parent_tx_timestamps=parent_tx_timestamps,
+                queried_hashes=queried_hashes,
+            ))
+
+        return internal_txs_with_timestamps, queried_hashes
+
+    def _process_internal_transactions_batch(
+            self,
+            new_internal_txs: list[EvmInternalTransaction],
+            address: ChecksumEvmAddress | None,
+            parent_tx_timestamps: dict[EVMTxHash, Timestamp],
+            queried_hashes: list[EVMTxHash] | None,
+    ) -> list[tuple[EvmInternalTransaction, Timestamp]]:
+        """Normalize a fetched internal-tx batch and return txs with parent timestamps."""
+        if len(new_internal_txs) == 0:
+            return []
+
+        existing_hashes: set[EVMTxHash] = set()
+        if queried_hashes is not None and len(parent_hashes := [
+            internal_tx.parent_tx_hash
+            for internal_tx in new_internal_txs
+            if internal_tx.value != 0
+        ]) != 0:
+            with self.database.conn.read_ctx() as cursor:
+                existing_hashes = self._get_existing_evm_tx_hashes(
+                    cursor=cursor,
+                    tx_hashes=parent_hashes,
+                )
+
+        internal_txs_with_timestamps: list[tuple[EvmInternalTransaction, Timestamp]] = []
+        for internal_tx in new_internal_txs:
+            if internal_tx.value == 0:
+                continue  # Only reason we need internal is for ether transfer. Ignore 0
+
+            # make sure internal transaction parent transactions are in the DB.
+            # new_internal_txs potentially contains internal txs of different parents.
+            if internal_tx.parent_tx_hash not in parent_tx_timestamps:
+                with self.database.conn.read_ctx() as cursor:
+                    tx, _ = self.get_or_create_transaction(
+                        cursor=cursor,
+                        tx_hash=internal_tx.parent_tx_hash,
+                        relevant_address=address,
+                    )
+                if queried_hashes is not None and tx.tx_hash not in existing_hashes:
+                    queried_hashes.append(tx.tx_hash)
+                    existing_hashes.add(tx.tx_hash)
+
+                timestamp = tx.timestamp
+                parent_tx_timestamps[internal_tx.parent_tx_hash] = timestamp
+            else:
+                timestamp = parent_tx_timestamps[internal_tx.parent_tx_hash]
+
+            internal_txs_with_timestamps.append((internal_tx, timestamp))
+
+        return internal_txs_with_timestamps
+
+    @overload
+    def _query_internal_transactions_for_parent_hash(
+            self,
+            parent_tx_hash: EVMTxHash,
+            address: ChecksumEvmAddress | None = None,
+            return_queried_hashes: Literal[True] = True,
+            known_parent_timestamps: dict[EVMTxHash, Timestamp] | None = None,
+    ) -> tuple[list[EvmInternalTransaction], list[EVMTxHash]]:
+        ...
+
+    @overload
+    def _query_internal_transactions_for_parent_hash(
+            self,
+            parent_tx_hash: EVMTxHash,
+            address: ChecksumEvmAddress | None = None,
+            return_queried_hashes: Literal[False] = False,
+            known_parent_timestamps: dict[EVMTxHash, Timestamp] | None = None,
+    ) -> tuple[list[EvmInternalTransaction], None]:
+        ...
+
+    @overload
+    def _query_internal_transactions_for_parent_hash(
+            self,
+            parent_tx_hash: EVMTxHash,
+            address: ChecksumEvmAddress | None = None,
+            return_queried_hashes: bool = False,
+            known_parent_timestamps: dict[EVMTxHash, Timestamp] | None = None,
+    ) -> tuple[list[EvmInternalTransaction], list[EVMTxHash] | None]:
+        ...
+
+    def _query_internal_transactions_for_parent_hash(
+            self,
+            parent_tx_hash: EVMTxHash,
+            address: ChecksumEvmAddress | None = None,
+            return_queried_hashes: bool = False,
+            known_parent_timestamps: dict[EVMTxHash, Timestamp] | None = None,
+    ) -> tuple[list[EvmInternalTransaction], list[EVMTxHash] | None]:
+        """Fetch internal txs for a parent hash without replacing DB internals.
+
+        This method only performs querying/deserialization and parent-tx
+        normalization. The caller decides when/how to persist using
+        `_replace_internal_transactions_for_parent_hash`.
+        """
+        internal_txs_with_timestamps, queried_hashes = self._query_internal_transactions(
+            query_period_or_hash=parent_tx_hash,
+            address=address,
+            return_queried_hashes=return_queried_hashes,
+            known_parent_timestamps=known_parent_timestamps,
+        )
+        return [entry[0] for entry in internal_txs_with_timestamps], queried_hashes
+
+    def _replace_internal_transactions_for_parent_hash(
+            self,
+            write_cursor: 'DBCursor',
+            parent_tx_hash: EVMTxHash,
+            transactions: list[EvmInternalTransaction],
+    ) -> None:
+        """Atomically replace all internal tx rows for a single parent tx hash."""
+        self.dbevmtx.delete_evm_internal_transactions_by_parent_tx_hash(
+            write_cursor=write_cursor,
+            parent_tx_hash=parent_tx_hash,
+            chain_id=self.evm_inquirer.chain_id,
+        )
+        if len(transactions) != 0:
+            self.dbevmtx.add_evm_internal_transactions(
+                write_cursor=write_cursor,
+                transactions=transactions,
+                relevant_address=None,
+            )
+
+    def _get_internal_transactions_for_ranges(
+            self,
+            address: ChecksumEvmAddress,
+            start_ts: Timestamp,
+            end_ts: Timestamp,
+    ) -> None:
+        """Queries etherscan for all internal transactions of address in the given ranges.
+
+        If any internal transactions are found, they are added in the DB
+        """
+        location_string = f'{self.evm_inquirer.blockchain.to_range_prefix("internaltxs")}_{address}'  # noqa: E501
+        with self.database.conn.read_ctx() as cursor:
+            ranges_to_query = self.dbranges.get_location_query_ranges(
+                cursor=cursor,
+                location_string=location_string,
+                start_ts=start_ts,
+                end_ts=end_ts,
+            )
+        for query_start_ts, query_end_ts in ranges_to_query:
+            log.debug(f'Querying {self.evm_inquirer.chain_name} internal transactions for {address} -> {query_start_ts} - {query_end_ts}')  # noqa: E501
+            try:
+                self._query_and_save_internal_transactions_for_range(
+                    address=address,
+                    period=TimestampOrBlockRange(
+                        range_type='timestamps',
+                        from_value=query_start_ts,
+                        to_value=query_end_ts,
+                    ),
+                    location_string=location_string,
+                )
+            except NoAvailableIndexers as e:
+                log.warning(
+                    f'Skipping {self.evm_inquirer.chain_name} internal transactions query '
+                    f'for {address} due to {e!s}.',
+                )
+                return
+            except RemoteError as e:
+                log.error(
+                    f'Got error "{e!s}" while querying internal {self.evm_inquirer.chain_name} '
+                    f'transactions from indexers. Transactions not added to the DB '
+                    f'address: {address} '
+                    f'from_ts: {query_start_ts} '
+                    f'to_ts: {query_end_ts} ',
+                )
+                return
+
+        log.debug(f'Internal {self.evm_inquirer.chain_name} transactions for address {address} done. Update range {start_ts} - {end_ts}')  # noqa: E501
+        with self.database.user_write() as write_cursor:
+            self.dbranges.update_used_query_range(  # entire range is now considered queried
+                write_cursor=write_cursor,
+                location_string=location_string,
+                queried_ranges=[(start_ts, end_ts)],
+            )
+
+    def _get_erc20_transfers_for_ranges(
+            self,
+            address: ChecksumEvmAddress,
+            start_ts: Timestamp,
+            end_ts: Timestamp,
+    ) -> None:
+        """Queries etherscan for all erc20 transfers of address in the given ranges.
+
+        If any transfers are found, they are added in the DB
+        """
+        location_string = f'{self.evm_inquirer.blockchain.to_range_prefix("tokentxs")}_{address}'
+        with self.database.conn.read_ctx() as cursor:
+            ranges_to_query = self.dbranges.get_location_query_ranges(
+                cursor=cursor,
+                location_string=location_string,
+                start_ts=start_ts,
+                end_ts=end_ts,
+            )
+
+        for query_start_ts, query_end_ts in ranges_to_query:
+            log.debug(f'Querying {self.evm_inquirer.chain_name} ERC20 Transfers for {address} -> {query_start_ts} - {query_end_ts}')  # noqa: E501
+            try:
+                self._query_and_save_erc20_transfers_for_range(
+                    address=address,
+                    period=TimestampOrBlockRange(
+                        range_type='timestamps',
+                        from_value=query_start_ts,
+                        to_value=query_end_ts,
+                    ),
+                    location_string=location_string,
+                )
+            except NoAvailableIndexers as e:
+                log.warning(
+                    f'Skipping {self.evm_inquirer.chain_name} token transactions query '
+                    f'for {address} due to {e!s}.',
+                )
+                return
+            except RemoteError as e:
+                log.error(
+                    f'Got error "{e!s}" while querying {self.evm_inquirer.chain_name} '
+                    f'token transactions from indexers. Transactions not added to the DB '
+                    f'address: {address} '
+                    f'from_ts: {query_start_ts} '
+                    f'to_ts: {query_end_ts} ',
+                )
+                return
+
+        log.debug(f'{self.evm_inquirer.chain_name} ERC20 Transfers done for address {address}. Update range {start_ts} - {end_ts}')  # noqa: E501
+        with self.database.user_write() as write_cursor:
+            self.dbranges.update_used_query_range(  # entire range is now considered queried
+                write_cursor=write_cursor,
+                location_string=location_string,
+                queried_ranges=[(start_ts, end_ts)],
+            )
+
+    @overload
+    def _query_and_save_erc20_transfers_for_range(
+            self,
+            address: ChecksumEvmAddress,
+            period: TimestampOrBlockRange,
+            location_string: str,
+            update_ranges: bool = True,
+            return_queried_hashes: Literal[True] = True,
+    ) -> list[EVMTxHash]:
+        ...
+
+    @overload
+    def _query_and_save_erc20_transfers_for_range(
+            self,
+            address: ChecksumEvmAddress,
+            period: TimestampOrBlockRange,
+            location_string: str,
+            update_ranges: bool = True,
+            return_queried_hashes: Literal[False] = False,
+    ) -> None:
+        ...
+
+    @overload
+    def _query_and_save_erc20_transfers_for_range(
+            self,
+            address: ChecksumEvmAddress,
+            period: TimestampOrBlockRange,
+            location_string: str,
+            update_ranges: bool = True,
+            return_queried_hashes: bool = False,
+    ) -> list[EVMTxHash] | None:
+        ...
+
+    def _query_and_save_erc20_transfers_for_range(
+            self,
+            address: ChecksumEvmAddress,
+            period: TimestampOrBlockRange,
+            location_string: str,
+            update_ranges: bool = True,
+            return_queried_hashes: bool = False,
+    ) -> list[EVMTxHash] | None:
+        """Helper function to abstract ERC20 transfer querying functionality for different range types
+
+        If update_ranges is True, updates the database tracking for this query range.
+        Otherwise, data is fetched without updating the query range.
+        """  # noqa: E501
+        from_block = self.evm_inquirer.get_blocknumber_by_time(ts=Timestamp(period.from_value))
+        to_block = self.evm_inquirer.get_blocknumber_by_time(ts=Timestamp(period.to_value))
+
+        log.debug(f'Querying erc20 transfers of {address} from {period.from_value} to {period.to_value} in {self.evm_inquirer.chain_name}')  # noqa: E501
+        queried_hashes: list[EVMTxHash] | None = [] if return_queried_hashes else None
+        queried_from_ts = Timestamp(period.from_value)
+        for erc20_tx_hashes in self.evm_inquirer.get_token_transaction_hashes(
+            account=address,
+            from_block=from_block,
+            to_block=to_block,
+        ):
+            existing_hashes: set[EVMTxHash] = set()
+            if queried_hashes is not None and len(erc20_tx_hashes) != 0:
+                with self.database.conn.read_ctx() as cursor:
+                    existing_hashes = self._get_existing_evm_tx_hashes(
+                        cursor=cursor,
+                        tx_hashes=erc20_tx_hashes,
+                    )
+
+            for tx_hash in erc20_tx_hashes:
+                with self.database.conn.read_ctx() as cursor:
+                    tx, _ = self.get_or_create_transaction(
+                        cursor=cursor,
+                        tx_hash=tx_hash,
+                        relevant_address=address,
+                    )
+                if queried_hashes is not None and tx.tx_hash not in existing_hashes:
+                    queried_hashes.append(tx.tx_hash)
+                    existing_hashes.add(tx.tx_hash)
+
+                if period.range_type == 'timestamps':
+                    queried_to_ts = Timestamp(max(queried_from_ts, tx.timestamp))
+                    log.debug(f'{self.evm_inquirer.chain_name} ERC20 Transfers for {address} -> update range {queried_from_ts} - {queried_to_ts}')  # noqa: E501
+                    if update_ranges:  # update last queried time for the address
+                        with self.database.user_write() as write_cursor:
+                            self.dbranges.update_used_query_range(
+                                write_cursor=write_cursor,
+                                location_string=location_string,
+                                queried_ranges=[(queried_from_ts, queried_to_ts)],
+                            )
+
+                    self.msg_aggregator.add_message(
+                        message_type=WSMessageType.TRANSACTION_STATUS,
+                        data={
+                            'address': address,
+                            'chain': self.evm_inquirer.blockchain.value,
+                            'subtype': str(TransactionStatusSubType.EVM),
+                            'period': [period.from_value, tx.timestamp],
+                            'status': str(TransactionStatusStep.QUERYING_EVM_TOKENS_TRANSACTIONS),
+                        },
+                    )
+                    queried_from_ts = queried_to_ts
+        return queried_hashes
+
+    def address_has_been_spammed(self, address: ChecksumEvmAddress) -> bool:
+        """
+        Queries erc20 transfers for the given address and if it has only transfer of spam assets
+        or ignored assets we return True. Stop at the first valid ERC20 transfer we find to exit
+        as early as possible. If any transfer had an unknown asset mark the address as not spammed
+        since we can't do more to classify it.
+        """
+        with self.database.conn.read_ctx() as cursor:
+            start_ts = Timestamp(0)
+            if (result := self.database.get_dynamic_cache(
+                cursor=cursor,
+                name=DBCacheDynamic.LAST_QUERY_TS,
+                location=self.evm_inquirer.chain_name,
+                location_name=LAST_SPAM_TXS_CACHE,
+                account_id=address,
+            )) is not None:
+                start_ts = Timestamp(result)
+
+        end_ts = ts_now()
+        checked_tokens = set()
+        with self.database.conn.read_ctx() as cursor:
+            ignored_assets = self.database.get_ignored_asset_ids(cursor)
+
+        log.debug(f'Address detection: querying {self.evm_inquirer.chain_name} ERC20 Transfers for {address} -> {start_ts} - {end_ts}')  # noqa: E501
+        try:
+            from_block = self.evm_inquirer.get_blocknumber_by_time(ts=start_ts)
+            to_block = self.evm_inquirer.get_blocknumber_by_time(ts=end_ts)
+
+            for erc20_tx_hashes in self.evm_inquirer.get_token_transaction_hashes(
+                account=address,
+                from_block=from_block,
+                to_block=to_block,
+            ):
+                for tx_hash in erc20_tx_hashes:
+                    raw_receipt_data = self.evm_inquirer.get_transaction_receipt(tx_hash)
+                    detected_transfers = 0
+                    for idx, log_entry in enumerate(raw_receipt_data['logs']):
+                        if len(log_entry['topics']) == 0:
+                            continue
+
+                        topic_raw = log_entry['topics'][0]
+                        try:
+                            topic = hexstring_to_bytes(topic_raw)
+                        except DeserializationError as e:
+                            log.error(f'Failed to read topic {topic_raw} for a transaction receipt at {ts_now!r}. {e!s}. Skipping')  # noqa: E501
+                            continue
+
+                        if topic != ERC20_OR_ERC721_TRANSFER:
+                            continue
+
+                        detected_transfers += 1
+                        log_address = deserialize_evm_address(log_entry['address'])
+                        if log_address in checked_tokens:
+                            continue
+
+                        identifier = evm_address_to_identifier(
+                            address=log_address,
+                            chain_id=self.evm_inquirer.chain_id,
+                            token_type=TokenKind.ERC20,
+                        )
+
+                        if identifier in ignored_assets:
+                            checked_tokens.add(log_address)
+                            continue
+
+                        try:
+                            token = EvmToken(identifier)
+                        except UnknownAsset:
+                            # since we don't track the token, check if the logs after this
+                            # log event are transfer log events only.
+                            for following_log_entry in raw_receipt_data['logs'][idx:]:
+                                if hexstring_to_bytes(following_log_entry['topics'][0]) == ERC20_OR_ERC721_TRANSFER:  # noqa: E501
+                                    detected_transfers += 1
+
+                                if detected_transfers > MULTISEND_SPAM_THRESHOLD:
+                                    break  # break this inner loop. Spam detected
+                            else:  # if we didn't break we mark it as not spammed
+                                return False
+
+                            break  # the transaction is spam and we continue to the next
+
+                        if token.protocol == SPAM_PROTOCOL:
+                            checked_tokens.add(log_address)
+                            continue
+
+                        # this token is not ignored, is not spam and exists in the database
+                        return False
+
+                    log.debug(f'Address detection: queried {self.evm_inquirer.chain_name} ERC20 Transfers for {address} -> range {start_ts} - {end_ts}')  # noqa: E501
+        except (RemoteError, KeyError) as e:
+            str_e = str(e)
+            if isinstance(e, KeyError):
+                str_e = f'Missing key {e}'
+
+            log.error(
+                f'Got error "{str_e}" while querying {self.evm_inquirer.chain_name} '
+                f'token transactions from Etherscan. address: {address} spam detection failed',
+            )
+            return False
+
+        with self.database.user_write() as write_cursor:
+            self.database.set_dynamic_cache(
+                write_cursor=write_cursor,
+                name=DBCacheDynamic.LAST_QUERY_TS,
+                value=end_ts,
+                location=self.evm_inquirer.chain_name,
+                location_name=LAST_SPAM_TXS_CACHE,
+                account_id=address,
+            )
+
+        return True
+
+    def ensure_tx_data_exists(
+            self,
+            cursor: 'DBCursor',
+            tx_hash: 'EVMTxHash',
+            relevant_address: Optional['ChecksumEvmAddress'],
+    ) -> tuple['EvmTransaction', 'EvmTxReceipt']:
+        """Makes sure that the required data for the transaction are in the database.
+        If not, pulls them and stores them. For most chains this is the transaction and the
+        receipt. Can be extended by subclasses for chain-specific information.
+
+        May raise:
+        - RemoteError if there is a problem querying the data sources or transaction hash does
+        not exist.
+        """
+        tx_receipt = self.dbevmtx.get_receipt(cursor=cursor, tx_hash=tx_hash, chain_id=self.evm_inquirer.chain_id)  # noqa: E501
+        if tx_receipt is not None:
+            return self.dbevmtx.get_transactions(
+                cursor=cursor,
+                filter_=EvmTransactionsFilterQuery.make(tx_hash=tx_hash, chain_id=self.evm_inquirer.chain_id),  # noqa: E501
+            )[0], tx_receipt  # all good, tx receipt is in the database
+
+        log.debug(f'Querying transaction data for {tx_hash=}({self.evm_inquirer.chain_name})')
+        transaction, raw_receipt_data = self.evm_inquirer.get_transaction_by_hash(tx_hash)
+        with self.database.conn.write_ctx() as write_cursor:
+            self.dbevmtx.add_transactions(
+                write_cursor=write_cursor,
+                evm_transactions=[transaction],
+                relevant_address=relevant_address,
+            )
+            self.dbevmtx.add_or_ignore_receipt_data(
+                write_cursor=write_cursor,
+                chain_id=self.evm_inquirer.chain_id,
+                data=raw_receipt_data,
+            )
+
+        tx_receipt = self.dbevmtx.get_receipt(cursor, tx_hash, self.evm_inquirer.chain_id)
+        return EvmTransaction(
+            tx_hash=transaction.tx_hash,
+            chain_id=transaction.chain_id,
+            timestamp=transaction.timestamp,
+            block_number=transaction.block_number,
+            from_address=transaction.from_address,
+            to_address=transaction.to_address,
+            value=transaction.value,
+            gas=transaction.gas,
+            gas_price=transaction.gas_price,
+            gas_used=transaction.gas_used,
+            input_data=transaction.input_data,
+            nonce=transaction.nonce,
+            db_id=cursor.execute(
+                'SELECT identifier FROM evm_transactions WHERE tx_hash=? AND chain_id=?',
+                (tx_hash, transaction.chain_id.serialize_for_db()),
+            ).fetchone()[0],
+            authorization_list=transaction.authorization_list,
+        ), tx_receipt  # type: ignore  # tx_receipt can't be None here
+
+    def get_and_ensure_internal_txns_of_parent_in_db(
+            self,
+            tx_hash: 'EVMTxHash',
+            chain_id: ChainID,
+            user_address: 'ChecksumEvmAddress',
+            to_address: 'ChecksumEvmAddress | None' = None,
+            from_address: 'ChecksumEvmAddress | None' = None,
+    ) -> list[EvmInternalTransaction]:
+        """Queries the internal transactions of a parent tx_hash, saves them in the DB and returns
+        them. Uses tx mappings to avoid querying the same parent hash repeatedly.
+
+        May raise:
+        - RemoteError if there is a problem querying the data sources or transaction hash does
+        not exist."""
+        # check if full internal txs for this parent tx and chain have already been queried.
+        with self.database.conn.read_ctx() as cursor:
+            was_queried = cursor.execute(
+                'SELECT 1 FROM evm_tx_mappings WHERE tx_id IN ('
+                'SELECT identifier FROM evm_transactions '
+                'WHERE tx_hash=? AND chain_id=?) AND value=?',
+                (tx_hash, chain_id.serialize_for_db(), TX_INTERNALS_QUERIED),
+            ).fetchone() is not None
+
+        if was_queried is False:
+            self._query_and_save_internal_transactions_for_parent_hash(parent_tx_hash=tx_hash)
+            with self.database.user_write() as write_cursor:
+                write_cursor.execute(
+                    'INSERT OR IGNORE INTO evm_tx_mappings(tx_id, value) '
+                    'SELECT identifier, ? FROM evm_transactions WHERE tx_hash=? AND chain_id=?',
+                    (TX_INTERNALS_QUERIED, tx_hash, chain_id.serialize_for_db()),
+                )
+            log.debug(
+                f'Queried full internal txs for {tx_hash!s} on {chain_id.to_name()} '
+                f'for {user_address} with filters from={from_address} to={to_address}.',
+            )
+
+        return self.dbevmtx.get_evm_internal_transactions(
+            parent_tx_hash=tx_hash,
+            blockchain=CHAINID_TO_SUPPORTED_BLOCKCHAIN[chain_id],
+            from_address=from_address,
+            to_address=to_address,
+        )
+
+    def get_or_create_transaction(
+            self,
+            cursor: 'DBCursor',
+            tx_hash: EVMTxHash,
+            relevant_address: Optional['ChecksumEvmAddress'],
+    ) -> tuple['EvmTransaction', 'EvmTxReceipt']:
+        """Gets an evm transaction and its receipt from the database or
+        if it doesn't exist, it pulls it from the data source and stores it in the database.
+        It ensures that the requirements of
+        the corresponding chain transaction are met before returning it. For example an
+        evm transaction must have a corresponding receipt entry in the database.
+
+        This function can raise:
+        - sqlcipher3.dbapi2.OperationalError if the SQL query fails due to invalid
+        filtering arguments.
+        - RemoteError if there is a problem querying the data source.
+        - DeserializationError if the transaction cannot be deserialized from the DB.
+        """
+        if tx_hash == GENESIS_HASH:
+            evm_tx, evm_tx_receipt = self.ensure_genesis_tx_data_exists()
+        else:
+            evm_tx, evm_tx_receipt = self.ensure_tx_data_exists(
+                cursor=cursor,
+                tx_hash=tx_hash,
+                relevant_address=relevant_address,
+            )
+
+        return evm_tx, evm_tx_receipt
+
+    def ensure_genesis_tx_data_exists(self) -> tuple['EvmTransaction', 'EvmTxReceipt']:
+        """
+        For each tracked account, query to see if it had any transactions in the genesis
+        block. We check this even if there already is a 0x0..0 transaction in the db
+        in order to be sure that genesis transactions are queried for all accounts.
+
+        Returns the genesis transaction and its receipt
+        """
+        with self.database.conn.read_ctx() as cursor:
+            accounts_data = self.database.get_blockchain_account_data(
+                cursor=cursor,
+                blockchain=self.evm_inquirer.chain_id.to_blockchain(),
+            )
+            for data in accounts_data:
+                self._get_transactions_for_range(
+                    address=data.address,
+                    start_ts=Timestamp(0),
+                    end_ts=Timestamp(0),
+                )
+
+            added_tx = self.dbevmtx.get_transactions(  # Check whether the genesis tx was added  # noqa: E501
+                cursor=cursor,
+                filter_=EvmTransactionsFilterQuery.make(tx_hash=GENESIS_HASH, chain_id=self.evm_inquirer.chain_id),  # noqa: E501
+            )
+
+        if len(added_tx) == 0:
+            raise InputError(
+                f'There is no tracked {self.evm_inquirer.chain_id!s} address that '
+                f'would have a genesis transaction',
+            )
+
+        tx_receipt_raw_data = self.evm_inquirer.get_transaction_receipt(tx_hash=GENESIS_HASH)
+        with self.database.user_write() as write_cursor:
+            self.dbevmtx.add_or_ignore_receipt_data(
+                write_cursor=write_cursor,
+                chain_id=self.evm_inquirer.chain_id,
+                data=tx_receipt_raw_data,
+            )
+
+        with self.database.conn.read_ctx() as cursor:
+            tx_receipt = self.dbevmtx.get_receipt(
+                cursor=cursor,
+                tx_hash=GENESIS_HASH,
+                chain_id=self.evm_inquirer.chain_id,
+            )
+
+        return added_tx[0], tx_receipt  # type: ignore  # tx_receipt was just added in the DB so should be there
+
+    def get_or_query_transaction_receipt(self, tx_hash: EVMTxHash) -> 'EvmTxReceipt':
+        """
+        Gets the receipt from the DB if it exists. If not queries the chain for it,
+        saves it in the DB and then returns it.
+
+        Also, if the actual transaction does not exist in the DB it queries it and saves it there.
+
+        May raise:
+
+        - DeserializationError
+        - RemoteError if the transaction hash can't be found in any of the connected nodes
+        """
+        if tx_hash == GENESIS_HASH:
+            _, tx_receipt = self.ensure_genesis_tx_data_exists()
+        else:
+            with self.database.conn.read_ctx() as cursor:
+                # If the transaction is not in the DB then query it and add it
+                transaction, tx_receipt = self.get_or_create_transaction(cursor=cursor, tx_hash=tx_hash, relevant_address=None)  # noqa: E501
+
+            if transaction.to_address is not None:  # internal transactions only through contracts  # noqa: E501
+                self._query_and_save_internal_transactions_for_parent_hash(
+                    address=None,  # get all internal transactions for the parent hash
+                    parent_tx_hash=tx_hash,
+                )
+        return tx_receipt
+
+    def get_receipts_for_transactions_missing_them(
+            self,
+            limit: int | None = None,
+            addresses: list[ChecksumEvmAddress] | None = None,
+    ) -> None:
+        """
+        Searches the database for up to `limit` transactions that have no corresponding receipt
+        and for each one of them queries the receipt and saves it in the DB.
+
+        It's protected by a lock to not enter the same code twice
+        (i.e. from periodic tasks and from pnl report history events gathering)
+
+        If the addresses argument is provided then it is used to filter the transactions missing
+        their receipt. If it is None then no distinction is made among the transactions.
+        """
+        with self.missing_receipts_lock:
+            if addresses is None:
+                tx_filter_query = EvmTransactionsFilterQuery.make(
+                    chain_id=self.evm_inquirer.chain_id,
+                )
+            else:
+                tx_filter_query = EvmTransactionsFilterQuery.make(
+                    accounts=[EvmAccount(address=x) for x in addresses],
+                    chain_id=self.evm_inquirer.chain_id,
+                )
+
+            hash_results = self.dbevmtx.get_transaction_hashes_no_receipt(
+                tx_filter_query=tx_filter_query,
+                limit=limit,
+            )
+
+            if len(hash_results) == 0:
+                return  # nothing to do
+
+            for entry in hash_results:
+                try:
+                    tx_receipt_data = self.evm_inquirer.get_transaction_receipt(tx_hash=entry)
+                except RemoteError as e:
+                    log.warning(f'Failed to query information for {self.evm_inquirer.chain_name} transaction {entry!s} due to {e!s}. Skipping...')  # noqa: E501
+                    continue
+
+                with self.database.user_write() as write_cursor:
+                    self.dbevmtx.add_or_ignore_receipt_data(
+                        write_cursor=write_cursor,
+                        chain_id=self.evm_inquirer.chain_id,
+                        data=tx_receipt_data,
+                    )
+
+    def add_transaction_by_hash(
+            self,
+            tx_hash: EVMTxHash,
+            associated_address: ChecksumEvmAddress,
+            must_exist: bool = False,
+    ) -> tuple['EvmTransaction', 'EvmTxReceipt']:
+        """Adds a transaction to the database by its hash and associates it with the provided address.
+
+        May raise:
+        - RemoteError if any of the remote queries fail.
+        - KeyError if there's a missing key in the tx_receipt dict.
+        - DeserializationError if there's an issue deserializing a value.
+        - InputError if the tx_hash or its receipt is not found on the blockchain or the address is not tracked.
+        - AlreadyExists if the tx_hash and receipt are present in the db.
+        """  # noqa: E501
+        with self.database.conn.read_ctx() as cursor:
+            tracked_accounts = self.database.get_blockchain_accounts(cursor).get(self.evm_inquirer.blockchain)  # noqa: E501
+            if associated_address not in tracked_accounts:
+                raise InputError(f'Address {associated_address} to associate with tx {tx_hash!s} is not tracked')  # noqa: E501
+
+            if len(self.dbevmtx.get_transactions(
+                cursor=cursor,
+                filter_=EvmTransactionsFilterQuery.make(tx_hash=tx_hash, chain_id=self.evm_inquirer.chain_id),  # noqa: E501
+            )) == 1 and self.dbevmtx.get_receipt(cursor=cursor, tx_hash=tx_hash, chain_id=self.evm_inquirer.chain_id) is not None:  # noqa: E501
+                raise AlreadyExists(f'Transaction {tx_hash!s} is already in the DB')
+
+        tx_result = self.evm_inquirer.maybe_get_transaction_by_hash(tx_hash=tx_hash, must_exist=must_exist)  # noqa: E501
+        if tx_result is None:
+            raise InputError(f'Transaction data for {tx_hash!s} not found on chain.')
+        transaction, receipt_data = tx_result
+        with self.database.user_write() as write_cursor:
+            self.dbevmtx.add_transactions(
+                write_cursor=write_cursor,
+                evm_transactions=[transaction],
+                relevant_address=associated_address,
+            )
+            self.dbevmtx.add_or_ignore_receipt_data(
+                write_cursor=write_cursor,
+                chain_id=self.evm_inquirer.chain_id,
+                data=receipt_data,
+            )
+
+        with self.dbevmtx.db.conn.read_ctx() as cursor:
+            tx_receipt = self.dbevmtx.get_receipt(
+                cursor=cursor,
+                tx_hash=tx_hash,
+                chain_id=self.evm_inquirer.chain_id,
+            )
+        assert tx_receipt is not None, 'transaction receipt was added just above, so should exist'
+        return transaction, tx_receipt
+
+    def get_chain_specific_multiaddress_data(
+            self,
+            addresses: Sequence[ChecksumEvmAddress],  # pylint: disable=unused-argument
+    ) -> None:
+        """Can be implemented by each chain subclass to add chain-specific data queries
+        for all tracked addresses at once"""
+        return None
+
+    @overload
+    def refetch_transactions_for_address(
+            self,
+            address: ChecksumEvmAddress,
+            start_ts: Timestamp,
+            end_ts: Timestamp,
+            return_queried_hashes: Literal[True],
+    ) -> list[EVMTxHash]:
+        ...
+
+    @overload
+    def refetch_transactions_for_address(
+            self,
+            address: ChecksumEvmAddress,
+            start_ts: Timestamp,
+            end_ts: Timestamp,
+            return_queried_hashes: Literal[False] = False,
+    ) -> None:
+        ...
+
+    @overload
+    def refetch_transactions_for_address(
+            self,
+            address: ChecksumEvmAddress,
+            start_ts: Timestamp,
+            end_ts: Timestamp,
+            return_queried_hashes: bool,
+    ) -> list[EVMTxHash] | None:
+        ...
+
+    @with_tx_status_messaging
+    def refetch_transactions_for_address(
+            self,
+            address: ChecksumEvmAddress,
+            start_ts: Timestamp,
+            end_ts: Timestamp,
+            return_queried_hashes: bool = False,
+    ) -> list[EVMTxHash] | None:
+        """Force refetch transactions for an address within a time range.
+
+       Directly queries for transactions, internal transactions, and ERC20
+       transfers without updating query ranges, allowing recovery of
+       potentially missed transactions.
+
+       May raise:
+       - DeserializationError
+       - sqlcipher3.dbapi2.OperationalError
+       - RemoteError if any of the remote queries fail.
+       """
+        period = TimestampOrBlockRange(
+            range_type='timestamps',
+            from_value=start_ts,
+            to_value=end_ts,
+        )
+        location_string = f'{self.evm_inquirer.blockchain.to_range_prefix("txs")}_{address}'
+        new_tx_hashes = self._query_and_save_transactions_for_range(
+            address=address,
+            period=period,
+            location_string=location_string,
+            update_ranges=False,
+            return_queried_hashes=return_queried_hashes,
+        )
+        internal_hashes = self._query_and_save_internal_transactions_for_range(
+            address=address,
+            period=period,
+            location_string=location_string,
+            update_ranges=False,
+            return_queried_hashes=return_queried_hashes,
+        )
+        erc20_hashes = self._query_and_save_erc20_transfers_for_range(
+            address=address,
+            period=period,
+            location_string=location_string,
+            update_ranges=False,
+            return_queried_hashes=return_queried_hashes,
+        )
+        if not return_queried_hashes:
+            return None
+
+        assert new_tx_hashes is not None and internal_hashes is not None and erc20_hashes is not None  # mypy doesn't detect the condition based on the if properly  # noqa: E501
+        return new_tx_hashes + internal_hashes + erc20_hashes

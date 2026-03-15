@@ -1,0 +1,151 @@
+import logging
+from typing import TYPE_CHECKING, Any
+
+from rotkehlchen.assets.utils import (
+    token_normalized_value,
+    token_normalized_value_decimals,
+)
+from rotkehlchen.chain.decoding.types import CounterpartyDetails
+from rotkehlchen.chain.evm.constants import WITHDRAWN_TOPIC
+from rotkehlchen.chain.evm.decoding.interfaces import EvmDecoderInterface
+from rotkehlchen.chain.evm.decoding.structures import (
+    DEFAULT_EVM_DECODING_OUTPUT,
+    DecoderContext,
+    EvmDecodingOutput,
+)
+from rotkehlchen.constants.assets import A_ETH, A_GLM
+from rotkehlchen.history.events.structures.types import HistoryEventSubType, HistoryEventType
+from rotkehlchen.logging import RotkehlchenLogsAdapter
+from rotkehlchen.types import ChecksumEvmAddress
+from rotkehlchen.utils.misc import bytes_to_address
+
+from .constants import (
+    CPT_OCTANT,
+    LOCKED,
+    OCTANT_DEPOSITS,
+    OCTANT_DEPOSITS_V2,
+    OCTANT_REWARDS,
+    STAKE_DEPOSITED_V2,
+    UNLOCKED,
+)
+
+if TYPE_CHECKING:
+    from rotkehlchen.chain.ethereum.node_inquirer import EthereumInquirer
+    from rotkehlchen.chain.evm.decoding.base import BaseEvmDecoderTools
+    from rotkehlchen.user_messages import MessagesAggregator
+
+logger = logging.getLogger(__name__)
+log = RotkehlchenLogsAdapter(logger)
+
+
+class OctantDecoder(EvmDecoderInterface):
+
+    def __init__(
+            self,
+            ethereum_inquirer: 'EthereumInquirer',
+            base_tools: 'BaseEvmDecoderTools',
+            msg_aggregator: 'MessagesAggregator',
+    ) -> None:
+        super().__init__(
+            evm_inquirer=ethereum_inquirer,
+            base_tools=base_tools,
+            msg_aggregator=msg_aggregator,
+        )
+        self.glm = A_GLM.resolve_to_evm_token()
+
+    def _decode_locker_events(self, context: DecoderContext) -> EvmDecodingOutput:
+        if context.tx_log.topics[0] not in (LOCKED, UNLOCKED, STAKE_DEPOSITED_V2):
+            return DEFAULT_EVM_DECODING_OUTPUT
+
+        if context.tx_log.topics[0] == LOCKED:
+            expected_type = HistoryEventType.SPEND
+            new_type = HistoryEventType.DEPOSIT
+            new_subtype = HistoryEventSubType.DEPOSIT_TO_PROTOCOL
+            verb, preposition, protocol_name = 'Lock', 'in', 'Octant'
+            amount_start, address_start = 32, 96
+            sequence_index = context.tx_log.log_index + 1  # push it after approval if any
+        elif context.tx_log.topics[0] == UNLOCKED:
+            expected_type = HistoryEventType.RECEIVE
+            new_type = HistoryEventType.WITHDRAWAL
+            new_subtype = HistoryEventSubType.WITHDRAW_FROM_PROTOCOL
+            verb, preposition, protocol_name = 'Unlock', 'from', 'Octant'
+            amount_start, address_start = 32, 96
+            sequence_index = context.tx_log.log_index + 1  # push it after approval if any
+        elif context.tx_log.topics[0] == STAKE_DEPOSITED_V2:
+            expected_type = HistoryEventType.SPEND
+            new_type = HistoryEventType.DEPOSIT
+            new_subtype = HistoryEventSubType.DEPOSIT_TO_PROTOCOL
+            verb, preposition, protocol_name = 'Lock', 'in', 'Octant v2'
+            amount_start, address_start = 32, 0
+            sequence_index = context.tx_log.log_index + 1  # push it after approval if any
+        else:
+            return DEFAULT_EVM_DECODING_OUTPUT
+
+        raw_amount = int.from_bytes(context.tx_log.data[amount_start:amount_start + 32])
+        address = bytes_to_address(context.tx_log.data[address_start:address_start + 32])
+        if self.base.is_tracked(address) is False:
+            return DEFAULT_EVM_DECODING_OUTPUT
+
+        amount = token_normalized_value(raw_amount, self.glm)
+
+        for event in context.decoded_events:
+            if (
+                    event.event_type == expected_type and
+                    event.asset == self.glm and
+                    event.address == context.tx_log.address and
+                    event.amount == amount
+            ):
+                event.event_type = new_type
+                event.event_subtype = new_subtype
+                event.counterparty = CPT_OCTANT
+                event.notes = f'{verb} {event.amount} GLM {preposition} {protocol_name}'
+                event.sequence_index = sequence_index
+                break
+        else:
+            log.error(f'Could not find corresponding GLM transfer for {protocol_name} {verb} at: {context.transaction.tx_hash!s}')  # noqa: E501
+
+        return DEFAULT_EVM_DECODING_OUTPUT
+
+    def _decode_reward_events(self, context: DecoderContext) -> EvmDecodingOutput:
+        if context.tx_log.topics[0] != WITHDRAWN_TOPIC:
+            return DEFAULT_EVM_DECODING_OUTPUT
+
+        user = bytes_to_address(context.tx_log.data[0:32])
+        if not self.base.is_tracked(user):
+            return DEFAULT_EVM_DECODING_OUTPUT
+
+        raw_amount = int.from_bytes(context.tx_log.data[32:64])
+        epoch = int.from_bytes(context.tx_log.data[64:96])
+        amount = token_normalized_value_decimals(raw_amount, 18)  # always ETH
+        for event in context.decoded_events:
+            if (
+                    event.event_type == HistoryEventType.RECEIVE and
+                    event.asset == A_ETH and
+                    event.location_label == user and
+                    event.amount == amount
+            ):
+                event.event_subtype = HistoryEventSubType.REWARD
+                event.counterparty = CPT_OCTANT
+                event.notes = f'Claim {event.amount} ETH as Octant epoch {epoch} reward'
+                break
+        else:
+            log.error(f'Could not find corresponding ETH receive transaction for Octant rewards withdrawal at: {context.transaction.tx_hash!s}')  # noqa: E501
+
+        return DEFAULT_EVM_DECODING_OUTPUT
+
+    # -- DecoderInterface methods
+
+    def addresses_to_decoders(self) -> dict[ChecksumEvmAddress, tuple[Any, ...]]:
+        return {
+            OCTANT_DEPOSITS: (self._decode_locker_events,),
+            OCTANT_DEPOSITS_V2: (self._decode_locker_events,),
+            OCTANT_REWARDS: (self._decode_reward_events,),
+        }
+
+    @staticmethod
+    def counterparties() -> tuple[CounterpartyDetails, ...]:
+        return (CounterpartyDetails(
+            identifier=CPT_OCTANT,
+            label='Octant',
+            image='octant.svg',
+        ),)
